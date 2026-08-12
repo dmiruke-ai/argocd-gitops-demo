@@ -275,4 +275,159 @@ Not investigated further since the direct `docker pull` is a more definitive che
 
 ---
 
+## 7. Wiring the ArgoCD Application — and a real pre-existing cluster bug found along the way
+
+`argocd/application.yaml` applied by hand (not "app of apps" — kept simple for this demo):
+
+```
+$ kubectl apply -f argocd/application.yaml
+application.argoproj.io/argocd-gitops-demo created
+```
+
+**It didn't sync.** `sync=Unknown health=` (empty), no resources appearing in the
+`argocd-gitops-demo` namespace. `argocd-application-controller` logs showed repeated:
+
+```
+redis: connection pool: failed to dial after 5 attempts: dial tcp: lookup argocd-redis: i/o timeout
+```
+
+### Diagnosis (narrowed down step by step, not guessed)
+
+1. Checked the `argocd-redis` Service/Endpoints — both correctly configured, pod healthy. Ruled
+   out a broken Service.
+2. Checked the `argocd-application-controller-network-policy` — `policyTypes: [Ingress]` only,
+   no egress restriction. Ruled out NetworkPolicy blocking DNS.
+3. Exec'd into `argocd-application-controller-0` (on node `foundation`) and tried
+   `getent hosts kubernetes.default.svc.cluster.local` (not even redis-specific) — **also timed
+   out.** Ruled out "specific to the redis hostname."
+4. `argocd-application-controller-0`'s minimal image had no `wget`/`curl`/`nc` to test raw
+   connectivity, so launched a `busybox` debug pod pinned to the same node
+   (`kubectl run netdebug --overrides='{"spec":{"nodeName":"foundation"}}'`) and ran
+   `nslookup ... 10.43.0.10` (CoreDNS's ClusterIP) — timed out. Tried again against CoreDNS's
+   **direct pod IP** (`10.42.0.177`, bypassing the Service/kube-proxy entirely) — **also timed
+   out.**
+
+**Conclusion: raw pod-to-pod networking between node `foundation` and node
+`thinkertoy192.168.1.32` (where CoreDNS runs) is broken on this cluster.** This is a pre-existing
+condition — not caused by installing ArgoCD, and consistent with the `neuron` node's independent
+`NotReady` status seen during initial cluster discovery (§1). Not something to attempt to fix by
+guessing at CNI internals on someone's real home-lab network without a clear diagnosis path, so
+this was raised as a decision point rather than worked around silently.
+
+### Workaround applied (by agreement — not a fix for the underlying network issue)
+
+Pinned every ArgoCD component to the single node already hosting most of them
+(`thinkertoy192.168.1.32`, which also runs CoreDNS), avoiding the broken cross-node path
+entirely:
+
+```
+$ for d in argocd-applicationset-controller argocd-dex-server argocd-notifications-controller \
+           argocd-redis argocd-repo-server argocd-server; do
+    kubectl -n argocd patch deployment "$d" --type=merge \
+      -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":"thinkertoy192.168.1.32"}}}}}'
+  done
+$ kubectl -n argocd patch statefulset argocd-application-controller --type=merge \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":"thinkertoy192.168.1.32"}}}}}'
+```
+
+All 7 pods rescheduled onto `thinkertoy192.168.1.32`. Redis connection errors disappeared from
+the application-controller logs immediately.
+
+**Forced an immediate sync** rather than waiting out the 2-minute resync period:
+
+```
+$ kubectl -n argocd annotate application argocd-gitops-demo argocd.argoproj.io/refresh=hard --overwrite
+application.argoproj.io/argocd-gitops-demo annotated
+```
+
+**Result — real resources deployed:**
+
+```
+$ kubectl -n argocd get application argocd-gitops-demo -o jsonpath='sync={.status.sync.status} health={.status.health.status}'
+sync=Synced health=Healthy
+
+$ kubectl -n argocd-gitops-demo get pods -o wide
+argocd-gitops-demo-5cbd648955-7scmv   1/1   Running   0   32s   10.42.5.186   foundation
+```
+
+(Note: the *app's own* pod landed back on `foundation` — that's fine, since the deployed
+workload itself doesn't need pod-to-pod calls to ArgoCD's components after deployment; only
+ArgoCD's own internal components needed to be co-located.)
+
+**Verified the app is actually serving traffic**, not just "Healthy" per ArgoCD's status:
+
+```
+$ kubectl -n argocd-gitops-demo port-forward svc/argocd-gitops-demo 18960:80 &
+$ curl -s http://localhost:18960/
+{"message":"hello from argocd-gitops-demo","version":"0.1.0","server_time":"2026-08-12T22:31:06.248494+00:00"}
+$ curl -s http://localhost:18960/health
+{"status":"ok"}
+```
+
+**Follow-up not done here, flagged for whenever the underlying network issue gets attention:**
+the `foundation` ↔ `thinkertoy` pod-networking break likely affects more than ArgoCD — anything
+scheduled across those two nodes needing to talk to each other would hit the same wall. Worth
+investigating the CNI (flannel, bundled with k3s) directly — VXLAN/wireguard backend
+misconfiguration between hosts is a common cause of exactly this symptom (Service and pod IPs
+both unreachable cross-node, single-node traffic fine).
+
+---
+
+## 8. Exposing the UI persistently (not just a temporary port-forward)
+
+`argocd-server` already *is* the UI (same component serves the API and the web UI on one port) —
+"installing the UI" here meant exposing it in a way that doesn't require an active
+`kubectl port-forward` every time.
+
+Considered Traefik (already running in this cluster, `kubectl get ingressclass` shows it
+available) but **deliberately avoided it**: Traefik's pods are spread across all 4 nodes
+(`svclb-traefik-*` DaemonSet pods, each with a striking restart count — 32 to 146 restarts —
+another sign this cluster's cross-node networking has been flaky for a while, consistent with
+sec.7's finding). Routing through a Traefik pod on a different node than `argocd-server`
+(pinned to `thinkertoy192.168.1.32`) risks the same cross-node wall.
+
+**Used a NodePort instead**, additive to (not replacing) the official ClusterIP `argocd-server`
+Service, deliberately targeting `argocd-server` pods directly:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server-nodeport
+  namespace: argocd
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: argocd-server
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8080
+      nodePort: 30443
+```
+
+```
+$ kubectl apply -f argocd/argocd-server-nodeport.yaml
+service/argocd-server-nodeport created
+```
+
+**Verified for real, not just "Service created":**
+
+```
+$ curl -sk --max-time 8 -o /dev/null -w "HTTP %{http_code}\n" https://192.168.1.32:30443/
+HTTP 200
+
+$ curl -sk --max-time 8 https://192.168.1.32:30443/ | head -c 300
+<!doctype html><html lang="en"><head>...<title>Argo CD</title>...
+```
+
+**Access:** `https://192.168.1.32:30443/` (self-signed cert — browser will warn, that's expected
+for this in-cluster default cert). **Important caveat:** this only works reliably from a host
+that can route to `192.168.1.32` directly, and only because `argocd-server` is pinned to that
+exact node — connecting via a different node's IP would hit the same cross-node networking bug
+from sec.7. Login: `admin` / the rotated password in `~/.secrets/argocd-admin-password` (never
+committed to this repo).
+
+---
+
 *(Sections below are appended as each step actually happens.)*

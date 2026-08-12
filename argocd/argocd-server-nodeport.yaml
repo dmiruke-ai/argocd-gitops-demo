@@ -1,0 +1,23 @@
+# Separate NodePort Service (doesn't replace the official install's ClusterIP argocd-server
+# Service -- additive, so nothing else that depends on that one breaks).
+#
+# Deliberately NodePort, not an Ingress via Traefik: Traefik's pods are spread across all 4
+# cluster nodes (see svclb-traefik pods), and the cross-node pod networking bug documented in
+# INSTALLATION_LOG.md sec.7 means routing through a Traefik pod on a different node than
+# argocd-server could hit the same wall. NodePort sidesteps this AS LONG AS you connect to the
+# NodePort on thinkertoy192.168.1.32 specifically (the node argocd-server is now pinned to) --
+# same-node traffic only, no cross-node hop required.
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server-nodeport
+  namespace: argocd
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: argocd-server
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8080
+      nodePort: 30443

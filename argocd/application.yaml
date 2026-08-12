@@ -1,0 +1,24 @@
+# The ArgoCD "Application" resource itself -- lives in the argocd namespace, applied once
+# by hand (kubectl apply, not by ArgoCD syncing itself -- that's the "app of apps" pattern,
+# deliberately not used here to keep this demo simple). Everything under manifests/ is what
+# THIS resource keeps in sync with the cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-gitops-demo
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/dmiruke-ai/argocd-gitops-demo.git
+    targetRevision: main
+    path: manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-gitops-demo
+  syncPolicy:
+    automated:
+      prune: true      # remove resources deleted from git
+      selfHeal: true    # revert any manual kubectl edits back to what git declares
+    syncOptions:
+      - CreateNamespace=false   # namespace.yaml in manifests/ already creates it
