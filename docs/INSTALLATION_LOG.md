@@ -430,4 +430,71 @@ committed to this repo).
 
 ---
 
-*(Sections below are appended as each step actually happens.)*
+## 9. End-to-end verification: a real push → real deploy
+
+Bumped `VERSION = "0.1.0"` → `"0.2.0"` in `app/main.py` — a real, visible code change, not a
+no-op commit — and pushed:
+
+```
+$ git push
+   f47ebb3..8fb6c6b  main -> main
+```
+
+**GitHub Actions**, triggered automatically by the `app/**` path filter:
+
+```
+$ gh run watch 31647458720 --repo dmiruke-ai/argocd-gitops-demo --exit-status
+✓ build-and-deploy in 29s
+  ✓ Build and push image
+  ✓ Update manifests/deployment.yaml with the new image tag
+  ✓ Commit and push the manifest update
+```
+
+**ArgoCD**, forced to refresh immediately rather than waiting out its ~3-minute poll interval
+(useful for this verification; in normal operation it would just pick this up on its own):
+
+```
+$ kubectl -n argocd annotate application argocd-gitops-demo argocd.argoproj.io/refresh=hard --overwrite
+$ kubectl -n argocd get application argocd-gitops-demo -o jsonpath='sync={.status.sync.status} health={.status.health.status} revision={.status.sync.revision}'
+sync=Synced health=Progressing revision=005043f3b18ab42499b059e59dccc49b3eb7650c
+
+$ kubectl -n argocd-gitops-demo get deployment argocd-gitops-demo -o jsonpath='{.spec.template.spec.containers[0].image}'
+ghcr.io/dmiruke-ai/argocd-gitops-demo:8fb6c6b45793e2dd8553acadff719a85b31067dd
+```
+
+Image tag matches the pushed commit SHA exactly (`8fb6c6b`) — confirms ArgoCD picked up the
+*correct* new commit, not a stale or unrelated one.
+
+```
+$ kubectl -n argocd-gitops-demo rollout status deployment/argocd-gitops-demo --timeout=90s
+deployment "argocd-gitops-demo" successfully rolled out
+```
+
+**Final proof — the live, running application actually serves the new version**, not just
+"the Deployment object says Healthy":
+
+```
+$ kubectl -n argocd-gitops-demo port-forward svc/argocd-gitops-demo 18961:80 &
+$ curl -s http://localhost:18961/
+{"message":"hello from argocd-gitops-demo","version":"0.2.0","server_time":"2026-08-12T22:35:06.561450+00:00"}
+```
+
+**The complete loop works, verified at every hop, not assumed at any of them:**
+
+```
+git push → GitHub Actions builds+pushes image → GHA commits new tag to manifests/
+  → ArgoCD detects the new commit → syncs → new pod rolls out → live app serves the new version
+```
+
+## Summary of real issues found and fixed along the way (not a clean install)
+
+1. `applicationsets.argoproj.io` CRD too large for client-side `kubectl apply` → server-side apply.
+2. Pre-existing cross-node pod networking failure (`foundation` ↔ `thinkertoy`) blocking ArgoCD's
+   internal component communication → diagnosed via elimination (Service → NetworkPolicy → DNS →
+   raw TCP to a pod IP) → worked around via node-pinning, by agreement, not silently.
+3. Exposing the UI via the cluster's existing Traefik ingress would likely hit the same
+   cross-node issue → used a NodePort targeting the pinned node directly instead.
+
+None of these were assumed fixed because a command returned exit 0 — each was checked by actually
+observing the resulting state (pods Running, image tags matching, HTTP responses with real
+content).
