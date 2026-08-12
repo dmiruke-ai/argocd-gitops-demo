@@ -1,0 +1,222 @@
+# ArgoCD GitOps Demo — Installation & Operations Log
+
+Living log of every real command run to set this up, with actual output — not a description of
+what *should* happen. Purpose: a learning record of installing ArgoCD, wiring a GitHub Actions
+build pipeline, and getting a push-to-deploy GitOps loop working end to end.
+
+**Target cluster:** an existing, persistent k3s home-lab cluster (NOT a disposable test cluster) —
+control-plane node `thinkertoy192.168.1.32`, worker nodes `deepthought`, `foundation`, `neuron`
+(the last shown `NotReady` at the time of writing, unrelated to this work). Already hosts
+`monitoring` and `opensearch` namespaces before this work began.
+
+---
+
+## 1. Pre-flight: cluster discovery
+
+This host (`damir@...`) turned out to be a `k3s-agent` (worker) already joined to this cluster —
+not a fresh install target. Confirmed before doing anything:
+
+```
+$ systemctl list-unit-files | grep -i k3s
+k3s-agent.service    enabled    enabled
+```
+
+```
+$ kubectl get nodes -o wide
+NAME                     STATUS     ROLES           AGE   VERSION
+deepthought              Ready      <none>          59d   v1.35.5+k3s1
+foundation               Ready      <none>          59d   v1.35.5+k3s1
+neuron                   NotReady   <none>          52d   v1.35.5+k3s1
+thinkertoy192.168.1.32   Ready      control-plane   79d   v1.35.5+k3s1
+```
+
+```
+$ kubectl get namespaces
+NAME              STATUS   AGE
+default           Active   79d
+kube-node-lease   Active   79d
+kube-public       Active   79d
+kube-system       Active   79d
+monitoring        Active   54d
+opensearch        Active   5d23h
+```
+
+```
+$ kubectl cluster-info
+Kubernetes control plane is running at https://192.168.1.32:6443
+CoreDNS is running at https://192.168.1.32:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+Metrics-server is running at https://192.168.1.32:6443/api/v1/namespaces/kube-system/services/https:metrics-server:https/proxy
+```
+
+**Decision:** reuse this cluster (confirmed with the user explicitly, since it's real persistent
+infrastructure, not a throwaway) rather than provision a second, redundant k3s control plane on
+this same host under existing memory pressure (see "Resource notes" below).
+
+## 2. Resource notes (context for why this mattered)
+
+Before starting, this host was at ~800MB free RAM with swap fully exhausted (VS Code, Firefox,
+OpenSearch, 4 concurrent Claude Code sessions, a redundant bare-metal Neo4j process alongside a
+dockerized one). User closed VS Code and Firefox, which recovered headroom to ~5.1GB free /
+8.9GB available before any cluster work began. Docker containers themselves were never the real
+consumer (biggest was 508MB; most were 3-10MB each) — worth remembering for next time: check
+`ps aux --sort=-%mem` before assuming Docker is the problem.
+
+---
+
+## 3. Installing ArgoCD (core components, no HA)
+
+```
+$ kubectl create namespace argocd
+namespace/argocd created
+```
+
+First attempt with plain client-side apply failed on one resource — the `applicationsets.argoproj.io`
+CRD is large enough that `kubectl apply`'s client-side `last-applied-configuration` annotation
+exceeds Kubernetes' 262144-byte annotation size limit (a known issue with this particular CRD,
+not specific to this cluster):
+
+```
+$ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+...
+The CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes
+```
+
+**Fix:** use server-side apply instead (documented ArgoCD workaround) — it doesn't store the
+whole previous config as a client-side annotation:
+
+```
+$ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --server-side --force-conflicts
+customresourcedefinition.apiextensions.k8s.io/applications.argoproj.io serverside-applied
+customresourcedefinition.apiextensions.k8s.io/applicationsets.argoproj.io serverside-applied
+customresourcedefinition.apiextensions.k8s.io/appprojects.argoproj.io serverside-applied
+... (all 58 resources applied cleanly)
+```
+
+**Waiting for rollout:**
+
+```
+$ kubectl -n argocd wait --for=condition=Available deployment --all --timeout=180s
+deployment.apps/argocd-applicationset-controller condition met
+deployment.apps/argocd-dex-server condition met
+deployment.apps/argocd-notifications-controller condition met
+deployment.apps/argocd-redis condition met
+deployment.apps/argocd-repo-server condition met
+deployment.apps/argocd-server condition met
+
+$ kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=180s
+partitioned roll out complete: 1 new pods have been updated...
+```
+
+**Final state — all 7 pods Running, scheduled across the cluster's other nodes (`foundation`,
+`thinkertoy`), not this local host:**
+
+```
+$ kubectl -n argocd get pods -o wide
+NAME                                                READY   STATUS    RESTARTS      NODE
+argocd-application-controller-0                     1/1     Running   0             foundation
+argocd-applicationset-controller-568dfdf75b-ht6dq   1/1     Running   0             thinkertoy192.168.1.32
+argocd-dex-server-856bcdf9ff-z6s4k                  1/1     Running   5 (88s ago)   thinkertoy192.168.1.32
+argocd-notifications-controller-6b4fd8f59-g4ht2     1/1     Running   0             thinkertoy192.168.1.32
+argocd-redis-54c57dd6ff-pj7cr                        1/1     Running   0             thinkertoy192.168.1.32
+argocd-repo-server-fd55df7c-v6vdj                   1/1     Running   0             thinkertoy192.168.1.32
+argocd-server-6cd5f98457-mrt5x                       1/1     Running   0             foundation
+```
+
+`argocd-dex-server` had 5 restarts during startup (likely a slow-starting dependency it
+liveness-probed against before it was ready) but stabilized to `1/1 Running` on its own — not
+investigated further since it self-resolved.
+
+## 4. Initial admin credentials
+
+```
+$ kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
+```
+
+**Security note, deliberately not logged here:** the actual password value is NOT recorded in
+this file, or anywhere else in this repo. This directory is going to become a git repo pushed to
+GitHub (see the GitHub Actions section below) — committing a real admin credential to a cluster
+that also hosts unrelated production-ish workloads (`monitoring`, `opensearch` namespaces) would
+be a real secret leak, not a hypothetical one.
+
+**Done as a real follow-up, not left as a TODO:**
+
+```
+$ curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+$ sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+$ argocd version --client
+argocd: v3.5.0+e95e1be
+
+$ kubectl -n argocd port-forward svc/argocd-server 18443:443 &
+Forwarding from 127.0.0.1:18443 -> 8080
+# (ports 8080 and 8888 were already taken by unrelated pre-existing services on this
+#  host -- docker-proxy and an otelcol-contrib instance, confirmed via `sudo ss -ltnp`
+#  before picking a different port, rather than fighting over ports blindly)
+
+$ argocd login 127.0.0.1:18443 --username admin --password <initial-password> --insecure
+'admin:login' logged in successfully
+
+$ argocd account update-password --current-password <initial-password> --new-password <new-password>
+Password updated
+
+$ kubectl -n argocd delete secret argocd-initial-admin-secret
+secret "argocd-initial-admin-secret" deleted from argocd namespace
+
+$ argocd account get-user-info
+Logged In: true
+Username: admin
+```
+
+The new password is stored at `~/.secrets/argocd-admin-password` (`chmod 600`), **outside** the
+`~/ARGOCD` project directory entirely, so it can never accidentally be swept into a `git add .`
+of this repo. The original initial-admin secret no longer exists in the cluster.
+
+---
+
+## 5. Minimal app + manifests
+
+`app/main.py` — a trivial FastAPI app (`/` returns version + server timestamp, `/health` for the
+readiness probe). Built and smoke-tested locally before writing any k8s manifests:
+
+```
+$ docker build -q -t argocd-gitops-demo:local-test .
+sha256:c425f827a8e579c3bf02aef71c9cdc5481fd2a41eb8b78de83343201fb9a3d03
+
+$ docker run -d --rm -p 18950:8000 argocd-gitops-demo:local-test
+$ curl -s http://localhost:18950/
+{"message":"hello from argocd-gitops-demo","version":"0.1.0","server_time":"2026-08-12T09:08:27.507658+00:00"}
+$ curl -s http://localhost:18950/health
+{"status":"ok"}
+```
+
+`manifests/namespace.yaml`, `service.yaml`, `deployment.yaml` written. The `image:` field in
+`deployment.yaml` is a placeholder (`ghcr.io/OWNER/argocd-gitops-demo:PLACEHOLDER`) until the
+real GitHub repo is created — this exact line is what CI will update on every push, and what
+ArgoCD watches for drift against the live cluster.
+
+Validated against the real cluster's API (server-side dry-run), namespace created for real since
+it's needed regardless of the eventual image tag:
+
+```
+$ kubectl apply -f manifests/namespace.yaml
+namespace/argocd-gitops-demo created
+
+$ kubectl apply --dry-run=server -f manifests/service.yaml
+service/argocd-gitops-demo created (server dry run)
+
+$ kubectl apply --dry-run=server -f manifests/deployment.yaml
+deployment.apps/argocd-gitops-demo created (server dry run)
+```
+
+(Note: server-side dry-run doesn't share state across resources in one batch or across separate
+`kubectl` invocations — dry-running namespace+service+deployment together failed with
+`namespaces "argocd-gitops-demo" not found` even right after the namespace dry-run reported
+success, because dry-run never actually persists anything. Not a manifest bug; just why the
+namespace was created for real before validating the rest.)
+
+`service.yaml`/`deployment.yaml` themselves are **not** applied for real yet — that's ArgoCD's
+job once it's wired to the repo (next sections), not something to apply ad-hoc outside the
+GitOps flow this whole exercise is about.
+
+---
+
+*(Sections below are appended as each step actually happens.)*

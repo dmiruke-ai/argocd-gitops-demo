@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-gitops-demo
+  namespace: argocd-gitops-demo
+  labels:
+    app: argocd-gitops-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: argocd-gitops-demo
+  template:
+    metadata:
+      labels:
+        app: argocd-gitops-demo
+    spec:
+      containers:
+        - name: app
+          # Updated by CI on every push -- this exact line is what ArgoCD watches for
+          # changes to. Never "latest": always an immutable tag (the commit SHA).
+          image: ghcr.io/dmiruke-ai/argocd-gitops-demo:initial
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

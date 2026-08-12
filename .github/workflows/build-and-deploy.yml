@@ -1,0 +1,59 @@
+name: build-and-deploy
+
+# Triggers only on changes to the app itself, never on changes to manifests/ or docs/ --
+# this job commits back to manifests/deployment.yaml, and without this path filter that
+# commit would re-trigger itself in an infinite loop.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/build-and-deploy.yml"
+
+concurrency:
+  group: build-and-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # to commit the updated image tag back to manifests/
+  packages: write   # to push the image to GHCR
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute lowercase image ref
+        id: image
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "ref=ghcr.io/${OWNER_LOWER}/argocd-gitops-demo:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+
+      - name: Update manifests/deployment.yaml with the new image tag
+        run: |
+          sed -i "s|image: .*|image: ${{ steps.image.outputs.ref }}|" manifests/deployment.yaml
+          git diff manifests/deployment.yaml
+
+      - name: Commit and push the manifest update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifests/deployment.yaml
+          git commit -m "deploy: ${{ steps.image.outputs.ref }}" || echo "no changes to commit"
+          git push
