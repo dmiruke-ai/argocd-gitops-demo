@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from fastapi import FastAPI
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 app = FastAPI(title="argocd-gitops-demo")
 
