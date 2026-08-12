@@ -219,4 +219,60 @@ GitOps flow this whole exercise is about.
 
 ---
 
+## 6. GitHub repo + first real CI run
+
+```
+$ gh api user --jq .login
+dmiruke-ai
+
+$ gh repo create argocd-gitops-demo --public --description "..." --source=/home/damir/ARGOCD --remote=origin
+https://github.com/dmiruke-ai/argocd-gitops-demo
+```
+
+`gitleaks detect` run against the whole project before the first commit — clean, no leaks.
+Committed and pushed:
+
+```
+$ git push -u origin main
+To https://github.com/dmiruke-ai/argocd-gitops-demo.git
+ * [new branch]      main -> main
+```
+
+Since the initial commit touches `app/**`, `.github/workflows/build-and-deploy.yml`'s path
+filter triggered it automatically — no manual `workflow_dispatch` needed:
+
+```
+$ gh run list --repo dmiruke-ai/argocd-gitops-demo --limit 5
+in_progress   Initial commit: ...   build-and-deploy   main   push   31582068141   9s
+
+$ gh run watch 31582068141 --repo dmiruke-ai/argocd-gitops-demo --exit-status
+✓ build-and-deploy in 37s
+  ✓ Checkout
+  ✓ Compute lowercase image ref
+  ✓ Log in to GHCR
+  ✓ Build and push image
+  ✓ Update manifests/deployment.yaml with the new image tag
+  ✓ Commit and push the manifest update
+```
+
+Full pipeline succeeded first try, 37 seconds end to end. Pulled `git`, confirmed the bot's
+follow-up commit updated `manifests/deployment.yaml`:
+
+```
+image: ghcr.io/dmiruke-ai/argocd-gitops-demo:350a317b810043f1710b33a4b54de9a7aaa7cf4d
+```
+
+Verified the image is real and actually pullable (not just "the workflow said success") by
+pulling it directly, rather than trusting the green checkmark alone:
+
+```
+$ docker pull ghcr.io/dmiruke-ai/argocd-gitops-demo:350a317b810043f1710b33a4b54de9a7aaa7cf4d
+Status: Downloaded newer image for ghcr.io/dmiruke-ai/argocd-gitops-demo:350a317b8...
+```
+
+(`gh api .../packages/.../versions` returned a 403 — the CLI token lacks `read:packages` scope.
+Not investigated further since the direct `docker pull` is a more definitive check anyway.)
+
+---
+
 *(Sections below are appended as each step actually happens.)*
