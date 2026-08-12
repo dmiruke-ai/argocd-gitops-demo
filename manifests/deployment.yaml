@@ -19,7 +19,7 @@ spec:
         - name: app
           # Updated by CI on every push -- this exact line is what ArgoCD watches for
           # changes to. Never "latest": always an immutable tag (the commit SHA).
-          image: ghcr.io/dmiruke-ai/argocd-gitops-demo:350a317b810043f1710b33a4b54de9a7aaa7cf4d
+          image: ghcr.io/dmiruke-ai/argocd-gitops-demo:8fb6c6b45793e2dd8553acadff719a85b31067dd
           ports:
             - containerPort: 8000
           readinessProbe:
